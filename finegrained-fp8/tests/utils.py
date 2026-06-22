@@ -42,6 +42,17 @@ DTYPE_TO_TOL = {
     torch.float32: (1e-4, 1e-4),
 }
 
+_XPU_ARCH_GEN_MASK = 0x000000FF00000000
+_XPU_BMG_GEN = 5
+
+
+def _is_xpu_bmg_device() -> bool:
+    if TEST_DEVICE != "xpu":
+        return False
+    arch = torch.xpu.get_device_capability()["architecture"]
+    gen = (arch & _XPU_ARCH_GEN_MASK) >> 32
+    return gen == _XPU_BMG_GEN
+
 
 def accelerator_module():
     if TEST_DEVICE == "cuda":
@@ -127,6 +138,45 @@ def make_weights(
             f"K ({in_features}) must be divisible by block_k ({block_k})"
         )
         scale_dtype, scale_layout, qmax = torch.float8_e8m0fnu, "block", E2M1_MAX
+        # Avoid OOM on BMG
+        if not is_2d and _is_xpu_bmg_device():
+            packed_k = in_features // NIBBLES_PER_BYTE
+            Wq = torch.empty(
+                E,
+                out_features,
+                packed_k,
+                dtype=torch.int8,
+                device=device,
+            )
+            inv_scales = torch.empty(
+                E,
+                out_features,
+                in_features // block_k,
+                dtype=torch.float8_e8m0fnu,
+                device=device,
+            )
+            boundaries = torch.tensor(_E2M1_BOUNDARIES, device=device)
+            for e in range(E):
+                w = torch.randn(
+                    out_features,
+                    in_features,
+                    dtype=torch.float32,
+                    device=device,
+                )
+                reshaped = w.reshape(out_features, in_features // block_k, block_k)
+                max_abs = reshaped.abs().amax(dim=-1)
+                safe = torch.where(max_abs > 0, max_abs, torch.ones_like(max_abs))
+                inv_scale_fp32 = (safe / qmax).to(torch.float32)
+                exp_ceil = _ue8m0_exp(inv_scale_fp32)
+                inv_scale_fp32 = (exp_ceil << 23).view(torch.float32)
+                scaled = (
+                    reshaped * (1.0 / inv_scale_fp32).unsqueeze(-1)
+                ).reshape(out_features, in_features)
+                codes = torch.bucketize(scaled.abs(), boundaries).to(torch.uint8)
+                codes |= (scaled < 0).to(torch.uint8) << 3
+                Wq[e] = (codes[:, 0::2] | (codes[:, 1::2] << 4)).view(torch.int8)
+                inv_scales[e] = exp_ceil.to(torch.uint8).view(torch.float8_e8m0fnu)
+            return Wq.contiguous(), inv_scales.contiguous()
     else:
         block_n, block_k = (
             block_size if block_size is not None else (out_features, in_features)

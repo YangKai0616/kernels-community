@@ -108,6 +108,44 @@ def get_active_device_type() -> str:
         return "cuda"
 
 
+def _tma_descriptor_needs_allocator() -> bool:
+    """Whether ``tl.make_tensor_descriptor`` is kept as a real hardware
+    descriptor (CUDA Hopper+ TMA) and therefore needs a Triton scratch allocator
+    at launch.
+    """
+    if get_active_device_type() != "cuda":
+        return False
+    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 9
+
+
+IS_TMA_SUPPORTED = _tma_descriptor_needs_allocator()
+
+_descriptor_allocator_registered = False
+
+
+def ensure_descriptor_allocator() -> None:
+    """Register the Triton scratch allocator for hardware tensor descriptors once,
+    on the first launch of a descriptor-emitting kernel. No-op unless on Hopper+
+    CUDA (``IS_TMA_SUPPORTED``); deferring to first launch (instead of registering
+    at import) avoids mutating global Triton state just by importing this package.
+    The closure resolves the device dynamically so the allocation lands on
+    whichever CUDA device the launch targets.
+    """
+    global _descriptor_allocator_registered
+    if _descriptor_allocator_registered or not IS_TMA_SUPPORTED:
+        return
+    _descriptor_allocator_registered = True
+
+    def _alloc(size: int, alignment: int, stream):
+        return torch.empty(
+            size,
+            device=torch.device("cuda", torch.cuda.current_device()),
+            dtype=torch.int8,
+        )
+
+    triton.set_allocator(_alloc)
+
+
 def get_accelerator_autotuning_configs(*, with_block_sizes: bool = False):
     """Autotune search grid for the current accelerator.
 
@@ -143,6 +181,33 @@ def get_accelerator_autotuning_configs(*, with_block_sizes: bool = False):
         for b in blocks
         for w in num_warps
         for s in num_stages
+    ]
+
+
+def get_block_dynamic_fp8_grouped_configs():
+    """Autotune grid for the block-dynamic grouped FP8 matmul.
+
+    ``grf_mode`` is a backend-only constexpr consumed by the Intel backend, 
+    never referenced in kernel logic.
+
+    XPU: The grid is the measured autotune winners for the DeepSeek V4 (E=256)
+    and Qwen3 (E=128) projection shapes.
+
+    Other backends (CUDA, ...): reuse the shared accelerator grid unchanged —
+    ``BLOCK_SIZE_N`` (= the weight-scale ``block_n``) and an inert ``grf_mode`` are
+    supplied at launch instead of being tuned.
+    """
+    if get_active_device_type() != "xpu":
+        return get_accelerator_autotuning_configs()
+    return [
+        triton.Config(
+            {"BLOCK_SIZE_N": bn, "grf_mode": grf},
+            num_warps=16,
+            num_stages=s,
+        )
+        for bn in (256, 512)
+        for grf in ("128", "256")
+        for s in (2, 3)
     ]
 
 

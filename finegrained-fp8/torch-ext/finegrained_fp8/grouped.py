@@ -23,10 +23,13 @@ from .utils import (
     NIBBLES_PER_BYTE,
     adaptive_block_size_m,
     device_context,
+    ensure_descriptor_allocator,
     mx_act_quant_inline,
     fp8_act_quant,
     fp8_act_quant_inline,
     get_accelerator_autotuning_configs,
+    get_active_device_type,
+    get_block_dynamic_fp8_grouped_configs,
     is_mxfp4,
     is_mxfp8,
     ue8m0_as_uint8,
@@ -131,8 +134,12 @@ def _store_tile(
     tl.store(c_ptrs, c, mask=row_mask[:, None])
 
 
+# NOTE: only this block-dynamic FP8 kernel uses the tensor-descriptor weight
+# load + transposed accumulation. The other three grouped kernels keep the
+# simpler masked-pointer load and (BLOCK_M, BLOCK_N) accumulation; mind this
+# asymmetry when touching `_grouped_tile_setup` / `_store_tile`.
 @triton.autotune(
-    configs=get_accelerator_autotuning_configs(),
+    configs=get_block_dynamic_fp8_grouped_configs(),
     key=["N", "K", "BLOCK_SIZE_M"],
 )
 @triton.jit
@@ -140,7 +147,7 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
     A,  # (S, K) raw BF16/FP16 activations, sorted/grouped by expert id
     B,  # (E, N, K) FP8 weight matrices
     C,  # (S, N) output
-    Bs,  # (E, N // BLOCK_SIZE_N, K // BLOCK_SIZE_K) weight scales
+    Bs,  # (E, N // SCALE_BLOCK_N, K // BLOCK_SIZE_K) weight scales
     Offsets,  # (E,) int32 — cumulative row-end per expert
     TileOffsets,  # (E,) int32 — cumulative tile-end per expert
     # Shape
@@ -164,13 +171,22 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
+    SCALE_BLOCK_N: tl.constexpr,
     NUM_EXPERTS: tl.constexpr,
     NUM_EXPERTS_BIT_LENGTH: tl.constexpr,
+    grf_mode: tl.constexpr = "128", # inert off XPU
 ):
     """Block-scale grouped FP8 expert matmul kernel.
 
     Tokens are assumed sorted by expert. The kernel maps each M-tile to its
     owning expert via ``TileOffsets`` and applies fused activation quantization.
+
+    ``BLOCK_SIZE_N`` is the output N-tile (autotuned on XPU, decoupled from the
+    weight-scale block) and ``SCALE_BLOCK_N`` is the per-block weight-scale width
+    (the caller's ``block_n``); a single N-tile spans
+    ``N_SCALE_TILES = BLOCK_SIZE_N // SCALE_BLOCK_N`` distinct scale columns.
+    Only those values are loaded per K-step and broadcast to the full N-tile,
+    avoiding a BLOCK_SIZE_N-element gather.
     """
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
@@ -192,30 +208,53 @@ def w8a8_block_dynamic_fp8_matmul_grouped_kernel(
         BLOCK_SIZE_N,
         BLOCK_SIZE_K,
     )
+    col_mask = offs_bn < N
 
     a_ptrs = A + offs_global_m[:, None] * stride_am + offs_k[None, :] * stride_ak
-    b_ptrs = (
-        B
-        + expert_id * stride_be
-        + offs_k[:, None] * stride_bk
-        + offs_bn[None, :] * stride_bn
+    # Read each expert's weight tile through a tensor descriptor so the backend
+    # promotes it to a 2D block load (XPU) / TMA (Hopper);
+    b_desc = tl.make_tensor_descriptor(
+        base=B + expert_id * stride_be,
+        shape=(N, K),
+        strides=(stride_bn, stride_bk),
+        block_shape=(BLOCK_SIZE_N, BLOCK_SIZE_K),
     )
-    bs_ptrs = Bs + expert_id * stride_bs_e + pid_n * stride_bs_n
+    # An N-tile spans N_SCALE_TILES = BLOCK_SIZE_N // SCALE_BLOCK_N scale columns
+    # (e.g. 4 for 512/128). Load just those and broadcast to SCALE_BLOCK_N output
+    # columns each, avoiding a BLOCK_SIZE_N gather; n_scale_mask guards BLOCK_SIZE_N > N.
+    N_SCALE_TILES: tl.constexpr = BLOCK_SIZE_N // SCALE_BLOCK_N
+    n_scale_base = pid_n * N_SCALE_TILES
+    bs_ptr = Bs + expert_id * stride_bs_e + n_scale_base * stride_bs_n
+    n_scale_mask = n_scale_base + tl.arange(0, N_SCALE_TILES) < (N // SCALE_BLOCK_N)
 
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    # Accumulate as [BLOCK_N, BLOCK_M] so the coalesced [BLOCK_N, BLOCK_K] weight
+    # tile feeds tl.dot directly; only the small activation tile is transposed
+    # per K-step, and the result transposed once before the store.
+    n_off = pid_n * BLOCK_SIZE_N
+    accumulator = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         a_raw = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float32)
         a, a_s = fp8_act_quant_inline(a_raw)
-        b = tl.load(b_ptrs)
-        b_s = decode_ue8m0_scale(tl.load(bs_ptrs))
-        accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
+        b = b_desc.load([n_off, k * BLOCK_SIZE_K])  # [BLOCK_N, BLOCK_K]
+        b_s_compact = tl.load(
+            bs_ptr + tl.arange(0, N_SCALE_TILES) * stride_bs_n,
+            mask=n_scale_mask,
+            other=0,
+        )
+        b_s = decode_ue8m0_scale(
+            tl.reshape(
+                tl.broadcast_to(b_s_compact[:, None], (N_SCALE_TILES, SCALE_BLOCK_N)),
+                (BLOCK_SIZE_N,),
+            )
+        )
+        accumulator += tl.dot(b, tl.trans(a)) * b_s[:, None] * a_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
-        bs_ptrs += stride_bs_k
+        bs_ptr += stride_bs_k
 
-    _store_tile(
-        C, accumulator, offs_global_m, offs_bn, row_mask, stride_cm, stride_cn
-    )
+    c = tl.trans(accumulator).to(C.dtype.element_ty)
+    c_ptrs = C + stride_cm * offs_global_m[:, None] + stride_cn * offs_bn[None, :]
+    c_mask = row_mask[:, None] & col_mask[None, :]
+    tl.store(c_ptrs, c, mask=c_mask)
 
 
 @triton.autotune(
@@ -551,7 +590,15 @@ def _w8a8_block_dynamic_fp8_matmul_grouped(
     tile_offsets, max_m_tiles = grouped_tile_layout(
         tokens_per_expert, BLOCK_SIZE_M, S, E
     )
-    grid = (max_m_tiles, triton.cdiv(N, block_n))
+
+    grid = lambda META: (max_m_tiles, triton.cdiv(N, META["BLOCK_SIZE_N"]))
+    target_kernel_kwargs = (
+        {} if get_active_device_type() == "xpu" else {"BLOCK_SIZE_N": block_n}
+    )
+
+    # Register the TMA scratch allocator on first launch (Hopper+ CUDA only;
+    # no-op elsewhere) — the kernel below emits a hardware tensor descriptor.
+    ensure_descriptor_allocator()
 
     with device_context(A.device):
         wrap_triton(w8a8_block_dynamic_fp8_matmul_grouped_kernel)[grid](
@@ -578,10 +625,11 @@ def _w8a8_block_dynamic_fp8_matmul_grouped(
             tile_offsets.stride(0),
             # Meta-parameters
             NUM_EXPERTS=E,
-            BLOCK_SIZE_N=block_n,
             BLOCK_SIZE_K=block_k,
+            SCALE_BLOCK_N=block_n,
             BLOCK_SIZE_M=BLOCK_SIZE_M,
             NUM_EXPERTS_BIT_LENGTH=E.bit_length(),
+            **target_kernel_kwargs,
         )
 
     return C
