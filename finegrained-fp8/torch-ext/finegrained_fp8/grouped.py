@@ -138,6 +138,91 @@ def _store_tile(
 # load + transposed accumulation. The other three grouped kernels keep the
 # simpler masked-pointer load and (BLOCK_M, BLOCK_N) accumulation; mind this
 # asymmetry when touching `_grouped_tile_setup` / `_store_tile`.
+@triton.jit
+def w8a8_block_dynamic_fp8_matmul_grouped_kernel_cuda(
+    A,  # (S, K) raw BF16/FP16 activations, sorted/grouped by expert id
+    B,  # (E, N, K) FP8 weight matrices
+    C,  # (S, N) output
+    Bs,  # (E, N // BLOCK_SIZE_N, K // BLOCK_SIZE_K) weight scales
+    Offsets,  # (E,) int32 — cumulative row-end per expert
+    TileOffsets,  # (E,) int32 — cumulative tile-end per expert
+    # Shape
+    S,
+    N,
+    K,
+    # Strides
+    stride_am,
+    stride_ak,
+    stride_be,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    stride_bs_e,
+    stride_bs_k,
+    stride_bs_n,
+    stride_offs,
+    stride_tile,
+    # Meta-parameters
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    NUM_EXPERTS: tl.constexpr,
+    NUM_EXPERTS_BIT_LENGTH: tl.constexpr,
+):
+    """CUDA-friendly grouped block-FP8 kernel.
+
+    This is the pre-XPU-optimization pointer-load implementation: it keeps the
+    simpler (BLOCK_M, BLOCK_N) accumulator layout and fixed-scale indexing,
+    avoiding the descriptor/transposition overhead that regressed smaller CUDA
+    shapes.
+    """
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+
+    total_tiles = tl.load(TileOffsets + (NUM_EXPERTS - 1) * stride_tile)
+    if pid_m >= total_tiles:
+        return
+
+    expert_id, offs_global_m, row_mask, offs_bn, offs_k = _grouped_tile_setup(
+        pid_m,
+        pid_n,
+        Offsets,
+        TileOffsets,
+        stride_offs,
+        stride_tile,
+        NUM_EXPERTS,
+        NUM_EXPERTS_BIT_LENGTH,
+        BLOCK_SIZE_M,
+        BLOCK_SIZE_N,
+        BLOCK_SIZE_K,
+    )
+
+    a_ptrs = A + offs_global_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = (
+        B
+        + expert_id * stride_be
+        + offs_k[:, None] * stride_bk
+        + offs_bn[None, :] * stride_bn
+    )
+    bs_ptrs = Bs + expert_id * stride_bs_e + pid_n * stride_bs_n
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for _ in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        a_raw = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float32)
+        a, a_s = fp8_act_quant_inline(a_raw)
+        b = tl.load(b_ptrs)
+        b_s = decode_ue8m0_scale(tl.load(bs_ptrs))
+        accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
+        bs_ptrs += stride_bs_k
+
+    _store_tile(
+        C, accumulator, offs_global_m, offs_bn, row_mask, stride_cm, stride_cn
+    )
+
+
 @triton.autotune(
     configs=get_block_dynamic_fp8_grouped_configs(),
     key=["N", "K", "BLOCK_SIZE_M"],
@@ -591,46 +676,74 @@ def _w8a8_block_dynamic_fp8_matmul_grouped(
         tokens_per_expert, BLOCK_SIZE_M, S, E
     )
 
-    grid = lambda META: (max_m_tiles, triton.cdiv(N, META["BLOCK_SIZE_N"]))
-    target_kernel_kwargs = (
-        {} if get_active_device_type() == "xpu" else {"BLOCK_SIZE_N": block_n}
-    )
-
-    # Register the TMA scratch allocator on first launch (Hopper+ CUDA only;
-    # no-op elsewhere) — the kernel below emits a hardware tensor descriptor.
-    ensure_descriptor_allocator()
-
     with device_context(A.device):
-        wrap_triton(w8a8_block_dynamic_fp8_matmul_grouped_kernel)[grid](
-            A,
-            B,
-            C,
-            Bs,
-            offsets,
-            tile_offsets,
-            S,
-            N,
-            K,
-            A.stride(0),
-            A.stride(1),
-            B.stride(0),
-            B.stride(2),
-            B.stride(1),
-            C.stride(0),
-            C.stride(1),
-            Bs.stride(0),
-            Bs.stride(2),
-            Bs.stride(1),
-            offsets.stride(0),
-            tile_offsets.stride(0),
-            # Meta-parameters
-            NUM_EXPERTS=E,
-            BLOCK_SIZE_K=block_k,
-            SCALE_BLOCK_N=block_n,
-            BLOCK_SIZE_M=BLOCK_SIZE_M,
-            NUM_EXPERTS_BIT_LENGTH=E.bit_length(),
-            **target_kernel_kwargs,
-        )
+        if get_active_device_type() == "xpu":
+            grid = lambda META: (max_m_tiles, triton.cdiv(N, META["BLOCK_SIZE_N"]))
+
+            # Register the TMA scratch allocator on first launch (Hopper+ CUDA only;
+            # no-op elsewhere) — the kernel below emits a hardware tensor descriptor.
+            ensure_descriptor_allocator()
+
+            wrap_triton(w8a8_block_dynamic_fp8_matmul_grouped_kernel)[grid](
+                A,
+                B,
+                C,
+                Bs,
+                offsets,
+                tile_offsets,
+                S,
+                N,
+                K,
+                A.stride(0),
+                A.stride(1),
+                B.stride(0),
+                B.stride(2),
+                B.stride(1),
+                C.stride(0),
+                C.stride(1),
+                Bs.stride(0),
+                Bs.stride(2),
+                Bs.stride(1),
+                offsets.stride(0),
+                tile_offsets.stride(0),
+                # Meta-parameters
+                NUM_EXPERTS=E,
+                BLOCK_SIZE_K=block_k,
+                SCALE_BLOCK_N=block_n,
+                BLOCK_SIZE_M=BLOCK_SIZE_M,
+                NUM_EXPERTS_BIT_LENGTH=E.bit_length(),
+            )
+        else:
+            grid = (max_m_tiles, triton.cdiv(N, block_n))
+            wrap_triton(w8a8_block_dynamic_fp8_matmul_grouped_kernel_cuda)[grid](
+                A,
+                B,
+                C,
+                Bs,
+                offsets,
+                tile_offsets,
+                S,
+                N,
+                K,
+                A.stride(0),
+                A.stride(1),
+                B.stride(0),
+                B.stride(2),
+                B.stride(1),
+                C.stride(0),
+                C.stride(1),
+                Bs.stride(0),
+                Bs.stride(2),
+                Bs.stride(1),
+                offsets.stride(0),
+                tile_offsets.stride(0),
+                # Meta-parameters
+                NUM_EXPERTS=E,
+                BLOCK_SIZE_N=block_n,
+                BLOCK_SIZE_K=block_k,
+                BLOCK_SIZE_M=BLOCK_SIZE_M,
+                NUM_EXPERTS_BIT_LENGTH=E.bit_length(),
+            )
 
     return C
 
@@ -997,3 +1110,4 @@ def matmul_grouped(
     return w8a8_block_dynamic_fp8_matmul_grouped(
         A, B, Bs, offsets, tokens_per_expert, block_size, output_dtype
     )
+
